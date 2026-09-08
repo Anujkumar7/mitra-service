@@ -20,6 +20,39 @@ the report renders without the photo. `pdf/story_images_page.py` builds the
 image page from `StoryMedia.objects.filter(story=..., include_in_story=True)`,
 so a missing row is invisible to report generation.
 
+How the audit works
+-------------------
+One sweep of the bucket, one pass over the stories, matched on the object key.
+
+  1. LIST the whole prefix once (not once per story) and group every object by
+     the identifier segment of its key - the `{storyId}` the client passed to
+     the presign endpoint. That is sometimes a numeric Story.id and sometimes a
+     session token, so both are kept as raw strings and resolved against real
+     rows rather than guessed at from shape.
+
+  2. Measure what share of those identifiers name a Story in THIS database.
+     Below --min-resolve the run stops without writing (see 'Before trusting a
+     full run' below).
+
+  3. For each story in scope, collect the keys its StoryMedia rows claim, from
+     both `file_url` and `file`, normalised to bare object keys. Compare that
+     set against the objects sitting under the story's identifier:
+
+       object present, row present   -> OK
+       object present, no row        -> ORPHAN_IN_S3   (the ticket's bug)
+       row present, object absent    -> MISSING_IN_S3
+       neither, but base64_str set   -> BASE64_ONLY
+       neither at all                -> NO_FILE_REF
+
+  4. --scan-unattributed then sweeps whatever the story pass never claimed and
+     separates "belongs to a story outside the filter" (OUT_OF_SCOPE) from
+     "names a story this database does not have" (STORY_NOT_IN_DB) from
+     "matches nothing at all" (UNATTRIBUTED_IN_S3). None of those three is a
+     finding; they exist so they cannot be mistaken for one.
+
+Everything is read-only: LIST against S3, SELECT against the database. The only
+file written is the CSV named by --out.
+
 Statuses
 --------
 Findings, in the order they usually matter:
@@ -55,6 +88,13 @@ Not findings - reported so they cannot be mistaken for findings:
   OK_FOREIGN_PATH     object exists under a different story id than the row's.
                       Rows migrated between environments keep the source
                       environment's id in the stored path. Do not backfill these.
+  PREDATES_STORY      object was already in the bucket before the story it is
+                      filed under existed, so it cannot be that story's photo.
+                      A bucket that outlives its database collects these: the
+                      database is reset, Story.id restarts, and old objects sit
+                      under numbers that now name different stories. Excluded
+                      from ORPHAN_IN_S3 because backfilling one would attach a
+                      stranger's photo to a report.
   STORY_NOT_IN_DB     object filed under a story id absent from this database -
                       deleted story or partial dump, not an upload failure.
   OUT_OF_SCOPE        object belongs to a story excluded by the current filters.
@@ -69,15 +109,15 @@ Usage
     # 1. Characterise a prefix and check its identifiers resolve to Stories.
     python manage.py audit_story_media_s3 --inspect chatbot/storymedia/
 
-    # 2. Every flow and cycle, photos only.
+    # 2. Every flow and cycle. Photos only is the default.
     python manage.py audit_story_media_s3 --prefix chatbot/storymedia/ \
-        --images-only --scan-unattributed --out orphans.csv
+        --scan-unattributed --out orphans.csv
 
     # 3. One flow over a date window. --flow matches ChatSession.session_type;
     #    run --list-flows for the values present in a given database.
     python manage.py audit_story_media_s3 --prefix chatbot/storymedia/ \
         --flow shikshalokam_chaupal --from 2026-06-01 --to 2026-08-26 \
-        --images-only --out chaupal.csv
+        --out chaupal.csv
 
     # 4. Specific sessions reported from the field.
     python manage.py audit_story_media_s3 --prefix chatbot/storymedia/ \
@@ -184,6 +224,12 @@ from chatbot.models.company_models import CompanyChat
 # identifier becomes a false ORPHAN_IN_S3. 80% is the same bar --inspect uses
 # when it calls a prefix usable, so the two cannot contradict each other.
 DEFAULT_MIN_RESOLVE = 0.8
+
+# --discover / --inspect display tuning. Constants rather than flags: they
+# change what the diagnostic looks like, never what it concludes, and no run
+# has ever needed a different value.
+MAX_CHILDREN = 40
+SAMPLE_KEYS = 3
 
 CSV_COLUMNS = [
     "status",
@@ -297,6 +343,64 @@ def to_object_key(raw, bucket, media_base):
 class Command(BaseCommand):
     help = "Audit StoryMedia rows against objects in S3 and report the mismatches."
 
+    # This command reads. It never writes to the database or to S3, so the
+    # system checks guard nothing here - they only bury the report under
+    # staticfiles and JSONField warnings that belong to the project, not to
+    # this run. Skipping them keeps the output to what was actually audited.
+    requires_system_checks = []
+
+    # ------------------------------------------------------------ formatting
+    #
+    # One visual language for every mode, so a reader who has seen one section
+    # can read the rest: rules separate sections, fields are label-then-number
+    # on a fixed column, and prose is reserved for the one line that says what
+    # to do next.
+
+    WIDTH = 70
+    LABEL = 22
+
+    def banner(self, title):
+        self.stdout.write("\n" + "=" * self.WIDTH)
+        self.stdout.write(f"  {title}")
+        self.stdout.write("=" * self.WIDTH)
+
+    def describe_scope(self, opts, images_only):
+        """One line saying what this run covers, so a narrow run can never be
+        mistaken for a full one when someone reads only the summary."""
+        parts = ["photos only" if images_only else "photos and PDFs"]
+        named = [
+            ("flow", "flow"), ("story_flow", "story-flow"), ("report_type", "report-type"),
+            ("state", "state"), ("district", "district"),
+            ("session", "session"), ("story_id", "story-id"),
+        ]
+        scoped = [f"--{label} {opts[key]}" for key, label in named if opts.get(key)]
+        if opts.get("date_from") or opts.get("date_to"):
+            scoped.append(f"{opts.get('date_from') or 'start'} .. {opts.get('date_to') or 'now'}")
+        parts.append(", ".join(scoped) if scoped else "all flows, all cycles")
+        if opts.get("limit"):
+            parts.append(f"first {opts['limit']} only")
+        return " | ".join(parts)
+
+    def rule(self, title=""):
+        if title:
+            self.stdout.write(f"\n--- {title} " + "-" * (self.WIDTH - len(title) - 5))
+        else:
+            self.stdout.write("-" * self.WIDTH)
+
+    def field(self, label, value, note="", style=None):
+        line = f"  {label:<{self.LABEL}} {value:>9}"
+        if note:
+            line = f"{line}   {note}"
+        self.stdout.write(style(line) if style else line)
+
+    def text_field(self, label, text, style=None):
+        line = f"  {label:<{self.LABEL}} {text}"
+        self.stdout.write(style(line) if style else line)
+
+    def note(self, text, style=None):
+        for line in text.strip("\n").split("\n"):
+            self.stdout.write(style(f"  {line}") if style else f"  {line}")
+
     def add_arguments(self, parser):
         parser.add_argument(
             "--prefix",
@@ -309,15 +413,6 @@ class Command(BaseCommand):
                  "object counts so the real folder_structure is visible.",
         )
         parser.add_argument("--bucket", help="Override S3_BUCKET_NAME.")
-        parser.add_argument(
-            "--max-children", type=int, default=40,
-            help="--discover: sub-prefixes to list per top-level prefix. Truncation "
-                 "is always reported, never silent.",
-        )
-        parser.add_argument(
-            "--samples", type=int, default=3,
-            help="--discover / --inspect: example full keys to print per prefix.",
-        )
         parser.add_argument(
             "--inspect",
             help="Print sample keys, identifier shapes and file types under one "
@@ -375,19 +470,12 @@ class Command(BaseCommand):
                  "numeric story id, and try to attribute them via CompanyChat.file_url.",
         )
         parser.add_argument(
-            "--no-basename-fallback", action="store_true",
-            help="Match strictly on the full object key. By default a key that "
-                 "does not match exactly is retried on basename, which catches "
-                 "rows written with a different prefix (reported as OK_BASENAME).",
-        )
-        parser.add_argument(
-            "--images-only", action="store_true",
-            help="Consider only image objects (jpg/png/webp/heic/...), ignoring "
-                 "PDFs. The ticket is about missing PHOTOS, and every report "
-                 "regeneration writes another PDF into the same folder, so old "
-                 "PDFs pile up with no row pointing at them. Without this flag "
-                 "those stale PDFs are counted as orphans and can outnumber the "
-                 "real finding.",
+            "--include-pdfs", action="store_true",
+            help="Audit PDF objects as well as photos. OFF by default: the ticket "
+                 "is about missing PHOTOS, and every report regeneration writes "
+                 "another PDF into the same folder, so stale PDFs accumulate with "
+                 "no row pointing at them. Counting those as orphans can outnumber "
+                 "the real finding several times over, so opt in deliberately.",
         )
         parser.add_argument(
             "--all-rows", action="store_true",
@@ -431,7 +519,7 @@ class Command(BaseCommand):
 
     # --------------------------------------------------------------- discover
 
-    def discover(self, client, bucket, max_children=40, samples=3):
+    def discover(self, client, bucket, max_children=MAX_CHILDREN, samples=SAMPLE_KEYS):
         """
         Show the bucket's top two prefix levels, with sample keys.
 
@@ -481,7 +569,7 @@ class Command(BaseCommand):
             "Story.session token; the audit matches either.\n"
         )
 
-    def inspect_prefix(self, client, bucket, prefix, samples):
+    def inspect_prefix(self, client, bucket, prefix, samples=SAMPLE_KEYS):
         """
         Characterise one prefix before trusting it as --prefix.
 
@@ -572,6 +660,32 @@ class Command(BaseCommand):
                 "pairing - it would report almost every object as an orphan.\n"
             ))
 
+    def predates_story(self, story, last_modified):
+        """
+        True when this object CANNOT belong to this story, because it was
+        already in the bucket before the story existed.
+
+        get_presigned_url builds every key from a storyId the client already
+        holds, so an upload can only ever follow story creation. An object
+        older than its story is therefore filed under a REUSED id: a long-lived
+        bucket kept its objects while the database behind it was reset and
+        Story.id restarted from 1. Today's story 1 then inherits a folder full
+        of a previous incarnation's photos.
+
+        Measured on devqa 2026-09-08: 182 of 201 candidate objects predated
+        their story, several by more than a year (story created 2026-06-17,
+        object uploaded 2024-12-19). Without this check all 182 were reported
+        as ORPHAN_IN_S3 - ten times the real number, every one of them work
+        that does not exist.
+
+        Deliberately conservative: if either timestamp is missing the object
+        stays a finding rather than being silently dropped. This proves an
+        object cannot belong to a story; it never proves that one does.
+        """
+        if not last_modified or not story.created_at:
+            return False
+        return last_modified < story.created_at
+
     def low_confidence_note(self):
         """
         The caveat appended to any finding whose truth depends on the bucket and
@@ -629,12 +743,13 @@ class Command(BaseCommand):
         numeric = [int(s) for s in identifiers if s.isdigit()]
         if numeric:
             db_range = Story.objects.aggregate(lo=Min("id"), hi=Max("id"))
-            lines.append("")
-            lines.append(f"  numeric ids in bucket : {min(numeric)} .. {max(numeric)}")
-            lines.append(f"  Story.id in database  : {db_range['lo']} .. {db_range['hi']}")
-        missing = sorted(set(identifiers) - resolved)[:10]
+            lines.append(f"  {'story ids in bucket':<{self.LABEL}} "
+                         f"{min(numeric)} .. {max(numeric)}")
+            lines.append(f"  {'story ids in database':<{self.LABEL}} "
+                         f"{db_range['lo']} .. {db_range['hi']}")
+        missing = sorted(set(identifiers) - resolved)[:8]
         if missing:
-            lines.append(f"  examples not in the DB: {', '.join(missing)}")
+            lines.append(f"  {'not in the database':<{self.LABEL}} {', '.join(missing)}")
         return lines
 
     def count_objects(self, client, bucket, prefix, cap=5000):
@@ -770,25 +885,27 @@ class Command(BaseCommand):
         total_media = StoryMedia.objects.count()
         with_media = StoryMedia.objects.values("story_id").distinct().count()
 
-        self.stdout.write(
-            f"preflight: {total_stories} stories, {total_media} StoryMedia rows, "
-            f"{with_media} stories with at least one media row"
-        )
+        self.rule("database")
+        self.field("stories", total_stories)
+        self.field("StoryMedia rows", total_media)
+        self.field("stories with media", with_media)
 
         if total_stories and (with_media / total_stories) < 0.05:
-            self.stdout.write(self.style.ERROR(
-                "\n  Fewer than 5% of stories have ANY StoryMedia row - including the\n"
-                "  PDF row that update_story_pdf requires to already exist. That is not\n"
-                "  a plausible production state, so the storymedia table in this\n"
-                "  database is very likely incomplete or was never loaded.\n"
-                "\n"
-                "  Every classification below is therefore untrustworthy:\n"
-                "    --db-only  -> NO_MEDIA will be inflated to ~100%\n"
-                "    S3 mode    -> ORPHAN_IN_S3 will be inflated to ~100%, because\n"
-                "                  every real object has no row to match against.\n"
-                "  Use this run to prove the plumbing works (prefix correct, keys\n"
-                "  parsed, matching logic sound). Do not read the counts as findings.\n"
-            ))
+            share = with_media / total_stories
+            self.stdout.write("")
+            self.note(
+                f"STOP: only {share:.1%} of stories have any StoryMedia row.",
+                self.style.ERROR)
+            self.note("""
+That includes the PDF row update_story_pdf requires to already exist, so
+this table is almost certainly incomplete or was never loaded. It is not a
+plausible production state.
+
+  --db-only   NO_MEDIA inflates to ~100%
+  S3 mode     ORPHAN_IN_S3 inflates to ~100% - every object has no row
+
+Treat this run as a plumbing test only. The counts are not findings.
+""", self.style.ERROR)
         return total_media
 
     def warn_flow_coverage(self, opts):
@@ -961,10 +1078,10 @@ class Command(BaseCommand):
         client, bucket = self.get_s3(opts.get("bucket"))
 
         if opts["discover"]:
-            self.discover(client, bucket, opts["max_children"], opts["samples"])
+            self.discover(client, bucket)
             return
         if opts["inspect"]:
-            self.inspect_prefix(client, bucket, opts["inspect"], opts["samples"])
+            self.inspect_prefix(client, bucket, opts["inspect"])
             return
 
         prefix = opts.get("prefix")
@@ -973,7 +1090,11 @@ class Command(BaseCommand):
         if not prefix.endswith("/"):
             prefix += "/"
 
-        basename_fallback = not opts["no_basename_fallback"]
+        # Photos are the finding; PDFs are regeneration exhaust. Default to
+        # photos so the common run is the correct one and the noisy variant
+        # has to be asked for by name.
+        images_only = not opts["include_pdfs"]
+
         rows = []
         counters = {
             "stories": 0,
@@ -988,14 +1109,18 @@ class Command(BaseCommand):
             "HOST_MISMATCH": 0,
         }
 
+        self.banner("StoryMedia <-> S3 audit")
+        self.text_field("bucket", bucket)
+        self.text_field("prefix", prefix)
+        self.text_field("scope", self.describe_scope(opts, images_only))
+
         self.preflight()
         self.warn_flow_coverage(opts)
         stories = self.build_queryset(opts)
         total = stories.count()
         if not self.warn_if_empty(opts, total):
             return
-        self.stdout.write(f"Bucket {bucket}, prefix {prefix}")
-        self.stdout.write(f"Auditing {total} stories ...\n")
+        self.field("stories in scope", total)
 
         allowed_hosts = {bucket}
         media_host = url_host(media_base)
@@ -1029,36 +1154,41 @@ class Command(BaseCommand):
         # too, but a diagnostic nobody is obliged to read is not a safeguard.
         index_segments = set(object_index)
         _, _, resolved_segments, self.resolve_rate = self.resolve_identifiers(index_segments)
-        self.stdout.write(
-            f"identifier resolve rate: {len(resolved_segments)} of "
-            f"{len(index_segments)} ({self.resolve_rate:.0%}) of the bucket's "
-            f"identifiers name a Story in this database"
-        )
+
+        self.rule("environment check")
+        self.field("identifiers in bucket", len(index_segments))
+        self.field("naming a story here", len(resolved_segments),
+                   f"({self.resolve_rate:.0%})")
+        self.field("required minimum", f"{opts['min_resolve']:.0%}")
+
         if self.resolve_rate < opts["min_resolve"]:
             detail = "\n".join(self.describe_resolve_failure(index_segments, resolved_segments))
             raise CommandError(
-                f"Only {self.resolve_rate:.0%} of the identifiers under {prefix} name a "
-                f"Story in this database, below the --min-resolve floor of "
-                f"{opts['min_resolve']:.0%}.\n"
-                f"{detail}\n\n"
-                f"  Every unresolved identifier would be reported as ORPHAN_IN_S3, so a "
-                f"run on this\n"
-                f"  pairing produces findings that are almost entirely artefacts of the "
-                f"mismatch.\n"
-                f"  Point --bucket at the environment this database came from, or run "
-                f"against a\n"
-                f"  database restored from the environment this bucket belongs to.\n\n"
-                f"  If the low rate is genuinely expected and you know why, rerun with "
-                f"--min-resolve\n"
-                f"  below {self.resolve_rate:.2f}. Nothing was written."
+                f"\n"
+                f"  STOPPED - nothing was written.\n"
+                f"\n"
+                f"  This bucket and this database are not the same environment, so an\n"
+                f"  object with no row cannot be told from an object whose story this\n"
+                f"  database never had.\n"
+                f"\n"
+                f"{detail}\n"
+                f"\n"
+                f"  Fix by either:\n"
+                f"    --bucket <host>       point at this database's own bucket\n"
+                f"    restore a dump        from the environment this bucket serves\n"
+                f"\n"
+                f"  Or override, only if you know why the rate is low:\n"
+                f"    --min-resolve {max(self.resolve_rate - 0.05, 0):.2f}    every ORPHAN_IN_S3 and MISSING_IN_S3\n"
+                f"                          row is then stamped UNTRUSTWORTHY in the CSV."
             )
+
         self.low_resolve = self.resolve_rate < DEFAULT_MIN_RESOLVE
         if self.low_resolve:
-            self.stdout.write(self.style.WARNING(
-                f"\n  Proceeding at {self.resolve_rate:.0%} because --min-resolve was "
-                f"lowered. Every ORPHAN_IN_S3\n"
-                f"  row will be marked untrustworthy in its notes column.\n"
-            ))
+            self.stdout.write("")
+            self.note(
+                f"proceeding at {self.resolve_rate:.0%} because --min-resolve was lowered - "
+                f"every\nORPHAN_IN_S3 and MISSING_IN_S3 row is stamped UNTRUSTWORTHY.",
+                self.style.WARNING)
 
         matched_segments = set()
 
@@ -1099,26 +1229,35 @@ class Command(BaseCommand):
                     story_objects.extend(object_index[ident])
 
             for key, size, last_modified in story_objects:
-                if opts["images_only"] and not is_image_key(key):
+                if images_only and not is_image_key(key):
                     continue
 
                 media = key_to_media.get(key)
                 status = "OK"
                 notes = ""
 
-                if media is None and basename_fallback:
+                if media is None:
                     media = basename_to_media.get(key.rsplit("/", 1)[-1])
                     if media is not None:
                         status = "OK_BASENAME"
                         notes = "matched on filename only - stored path differs from the S3 key"
 
                 if media is None:
-                    status = "ORPHAN_IN_S3"
-                    notes = (
-                        "object uploaded to S3 but no StoryMedia row references it - "
-                        "the /api/storymedia/ POST never completed"
-                    )
-                    notes += self.low_confidence_note()
+                    if self.predates_story(story, last_modified):
+                        status = "PREDATES_STORY"
+                        notes = (
+                            f"object predates the story it is filed under "
+                            f"(story created {story.created_at:%Y-%m-%d}, object "
+                            f"uploaded {last_modified:%Y-%m-%d}) - the id was reused "
+                            f"after a database reset, so this is NOT a lost row"
+                        )
+                    else:
+                        status = "ORPHAN_IN_S3"
+                        notes = (
+                            "object uploaded to S3 but no StoryMedia row references it - "
+                            "the /api/storymedia/ POST never completed"
+                        )
+                        notes += self.low_confidence_note()
                 else:
                     seen_media_ids.add(media.id)
                     if not media.include_in_story and media.media_type != MediaTypeChoices.PDF:
@@ -1159,7 +1298,7 @@ class Command(BaseCommand):
                     # these, so story_images_page emits <img src=""> and the
                     # report shows nothing - a rendering failure that is invisible
                     # to any S3 comparison, because there is no key to compare.
-                    if opts["images_only"] and media.media_type == MediaTypeChoices.PDF:
+                    if images_only and media.media_type == MediaTypeChoices.PDF:
                         continue
 
                     # Whether base64_str still holds the bytes decides the
@@ -1184,7 +1323,7 @@ class Command(BaseCommand):
                         story, "", "", "", media, pdf_row, status_no_key, note_no_key,
                     ))
                     continue
-                if opts["images_only"] and not is_image_key(claimed):
+                if images_only and not is_image_key(claimed):
                     continue
                 if not claimed.startswith(prefix):
                     continue  # belongs to another prefix (e.g. server-side PDF upload)
@@ -1233,7 +1372,7 @@ class Command(BaseCommand):
         if opts["scan_unattributed"]:
             rows.extend(self.scan_unattributed(
                 object_index, matched_segments, media_base, counters,
-                images_only=opts["images_only"],
+                images_only=images_only,
             ))
 
         self.write_out(rows, opts.get("out"))
@@ -1392,21 +1531,24 @@ class Command(BaseCommand):
 
         self.write_out(rows, opts.get("out"))
 
-        self.stdout.write("\n--- summary (DB only, S3 not consulted) ---")
-        self.stdout.write(f"stories examined      : {counters['stories']}")
-        self.stdout.write(f"OK                    : {counters['OK']}")
-        self.stdout.write(self.style.WARNING(
-            f"NO_MEDIA              : {counters['NO_MEDIA']}"))
-        self.stdout.write(self.style.ERROR(
-            f"NO_FILE_REF           : {counters['NO_FILE_REF']}"))
-        self.stdout.write(f"EXCLUDED              : {counters['EXCLUDED']}")
-        self.stdout.write(self.style.WARNING(
-            f"STALE_REPORT          : {counters['STALE_REPORT']}"))
-        self.stdout.write(
-            "\nNO_MEDIA is the candidate set for the orphan bug, but it is only a "
-            "candidate set: confirming an object is actually sitting in S3 for "
-            "those stories needs a run without --db-only.\n"
-        )
+        self.rule("results (database only - S3 not consulted)")
+        self.field("stories examined", counters["stories"])
+        self.stdout.write("")
+        self.field("OK", counters["OK"], "at least one usable media row")
+        self.field("NO_MEDIA", counters["NO_MEDIA"], "no media row at all",
+                   self.style.WARNING)
+        self.field("NO_FILE_REF", counters["NO_FILE_REF"], "row exists but points nowhere",
+                   self.style.ERROR)
+        self.field("STALE_REPORT", counters["STALE_REPORT"], "report older than the photo",
+                   self.style.WARNING)
+        self.field("EXCLUDED", counters["EXCLUDED"], "include_in_story=False")
+
+        self.rule("what to do next")
+        self.note("""
+NO_MEDIA is a CANDIDATE set, not a finding. It mixes stories that lost their
+photo with stories that were never asked for one. Proving an object is really
+sitting in S3 for those stories needs a run without --db-only.
+""")
 
     # -------------------------------------------------------- unattributed
 
@@ -1569,43 +1711,71 @@ class Command(BaseCommand):
         self.stdout.write(f"\nWrote {len(rows)} rows to {out_path}")
 
     def summarise(self, counters):
-        self.stdout.write("\n--- summary ---")
-        self.stdout.write(f"stories examined      : {counters['stories']}")
-        self.stdout.write(f"OK                    : {counters['OK']}")
-        self.stdout.write(f"OK_BASENAME           : {counters['OK_BASENAME']}")
-        self.stdout.write(
-            f"OK_FOREIGN_PATH       : {counters.get('OK_FOREIGN_PATH', 0)} "
-            f"(object exists under a different story id - migrated row, not a finding)"
-        )
-        self.stdout.write(self.style.ERROR(
-            f"ORPHAN_IN_S3          : {counters['ORPHAN_IN_S3']}"))
-        self.stdout.write(self.style.WARNING(
-            f"MISSING_IN_S3         : {counters['MISSING_IN_S3']}"))
-        self.stdout.write(f"EXCLUDED              : {counters['EXCLUDED']}")
-        self.stdout.write(self.style.WARNING(
-            f"STALE_REPORT          : {counters['STALE_REPORT']}"))
-        self.stdout.write(self.style.ERROR(
-            f"NO_FILE_REF           : {counters.get('NO_FILE_REF', 0)} "
-            f"(blank image, nothing left to restore)"))
-        self.stdout.write(self.style.WARNING(
-            f"BASE64_ONLY           : {counters.get('BASE64_ONLY', 0)} "
-            f"(blank image, but base64_str still holds the photo - recoverable)"))
-        self.stdout.write(self.style.WARNING(
-            f"HOST_MISMATCH         : {counters.get('HOST_MISMATCH', 0)} "
-            f"(key matches but file_url points at another environment's host)"))
-        self.stdout.write(f"UNATTRIBUTED_IN_S3    : {counters['UNATTRIBUTED_IN_S3']}")
-        if counters.get("STORY_NOT_IN_DB"):
-            self.stdout.write(
-                f"STORY_NOT_IN_DB       : {counters['STORY_NOT_IN_DB']} "
-                f"(story id absent from the DB - deleted or not dumped, not a finding)"
-            )
-        if counters.get("OUT_OF_SCOPE"):
-            self.stdout.write(
-                f"OUT_OF_SCOPE          : {counters['OUT_OF_SCOPE']} "
-                f"(objects belonging to stories outside the filter - not a finding)"
-            )
-        self.stdout.write(
-            "\nORPHAN_IN_S3 and STALE_REPORT are the two sets that need "
-            "remediation: the first needs a StoryMedia row created, both need "
-            "the report regenerated afterwards.\n"
-        )
+        """
+        Grouped by what the reader has to DO, not by status name.
+
+        A flat list of twelve statuses makes every line look equally urgent, so
+        the two that need work sit at the same weight as the nine that are
+        context. These groups put the actionable rows first and label the rest
+        explicitly as background, so a run can be read in one pass.
+        """
+        groups = [
+            ("NEEDS ACTION", self.style.ERROR, [
+                ("ORPHAN_IN_S3", "photo in S3, no row -> create row, regenerate"),
+                ("BASE64_ONLY", "photo in base64_str -> upload, set url, regenerate"),
+                ("STALE_REPORT", "report older than the photo -> regenerate"),
+                ("HOST_MISMATCH", "row points at another host -> fix stored URL"),
+            ]),
+            ("CANNOT BE RECOVERED", self.style.WARNING, [
+                ("NO_FILE_REF", "no key and no base64 - the photo is gone"),
+                ("MISSING_IN_S3", "row names a key that is not in the bucket"),
+            ]),
+            ("HEALTHY", None, [
+                ("OK", ""),
+                ("OK_BASENAME", "matched on filename, stored path differs"),
+                ("OK_FOREIGN_PATH", "migrated row - do not backfill"),
+                ("EXCLUDED", "include_in_story=False - check if deliberate"),
+            ]),
+            ("NOT FINDINGS", None, [
+                ("PREDATES_STORY", "object older than the story - reused id"),
+                ("STORY_NOT_IN_DB", "story absent from this database"),
+                ("OUT_OF_SCOPE", "story outside the current filters"),
+                ("UNATTRIBUTED_IN_S3", "key matches no story at all"),
+            ]),
+        ]
+
+        self.rule("results")
+        self.field("stories examined", counters["stories"])
+
+        for title, style, statuses in groups:
+            present = [(s, note) for s, note in statuses if counters.get(s, 0)]
+            if not present:
+                continue
+            self.stdout.write("")
+            self.stdout.write(style(f"  {title}") if style else f"  {title}")
+            for status, note in present:
+                self.field(f"  {status}", counters.get(status, 0), note)
+
+        orphans = counters.get("ORPHAN_IN_S3", 0)
+        stale = counters.get("STALE_REPORT", 0)
+        base64_only = counters.get("BASE64_ONLY", 0)
+
+        self.rule("what to do next")
+        if not (orphans or stale or base64_only):
+            self.note("Nothing to remediate in this scope.")
+            return
+        if orphans:
+            self.note(f"{orphans} photo(s) are in S3 with no StoryMedia row. Create the row "
+                      f"from the\nexisting key, then regenerate the report. Do NOT re-upload - "
+                      f"the bytes\nare already in the bucket.")
+        if base64_only:
+            self.note(f"{base64_only} photo(s) survive only as base64_str. Upload the bytes, set "
+                      f"file_url,\nthen regenerate.")
+        if stale:
+            self.note(f"{stale} report(s) were rendered before their photo was recorded. "
+                      f"Regeneration\nalone is enough.")
+        if self.low_resolve:
+            self.stdout.write("")
+            self.note("These counts ran below --min-resolve. Every row is stamped "
+                      "UNTRUSTWORTHY\nin the CSV - confirm the environment pairing before "
+                      "acting on them.", self.style.WARNING)
