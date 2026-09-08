@@ -560,7 +560,8 @@ class Command(BaseCommand):
             if len(subs) > max_children:
                 self.stdout.write(self.style.WARNING(
                     f"    ... and {len(subs) - max_children} MORE sub-prefixes not "
-                    f"shown (raise --max-children to see them)"
+                    f"shown (display cap MAX_CHILDREN={max_children}) - run "
+                    f"--inspect on one of these to see inside it"
                 ))
 
         self.stdout.write(
@@ -608,6 +609,15 @@ class Command(BaseCommand):
                 examples.append((key, size))
 
         self.stdout.write(f"\nPrefix: {prefix}   ({total} objects)\n")
+
+        # Bail before printing sample/shape/type sections that would all be
+        # empty. An empty prefix is a spelling problem, not a finding.
+        if not total:
+            self.note(
+                f"No objects at all under '{prefix}'. Nothing to characterise - check\n"
+                f"the spelling, or run --discover for the real key layout.\n",
+                self.style.WARNING)
+            return
         self.stdout.write("sample keys:")
         for key, size in examples:
             self.stdout.write(f"  {size:>10}  {key}")
@@ -621,10 +631,11 @@ class Command(BaseCommand):
             self.stdout.write(f"  {count:>7}  {ext}")
 
         if not identifiers:
-            self.stdout.write(self.style.WARNING(
-                "\nNo identifier segments at all - objects sit directly under this "
-                "prefix, so no key-based join to a Story is possible here.\n"
-            ))
+            self.note(
+                "\nObjects exist here but none carry an identifier segment - they sit "
+                "directly\nunder this prefix, so no key-based join to a Story is "
+                "possible.\n",
+                self.style.WARNING)
             return
 
         by_session, by_id, resolved, rate = self.resolve_identifiers(identifiers)
@@ -1153,6 +1164,13 @@ Treat this run as a plumbing test only. The counts are not findings.
         # full page of uniformly wrong findings. --inspect reports this number
         # too, but a diagnostic nobody is obliged to read is not a safeguard.
         index_segments = set(object_index)
+        if not index_segments:
+            raise CommandError(
+                f"  No objects found under prefix '{prefix}' in bucket {bucket}.\n"
+                f"Run --discover to see the real key layout, or --inspect to "
+                f"characterise a candidate prefix."
+            )
+
         _, _, resolved_segments, self.resolve_rate = self.resolve_identifiers(index_segments)
 
         self.rule("environment check")
